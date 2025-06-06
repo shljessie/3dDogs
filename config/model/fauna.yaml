@@ -24,12 +24,15 @@ cfg_render:
   spatial_scale: 7
   background_mode: none  # none (black), white, checkerboard, background, input
   render_flow: false
-  cam_pos_z_offset: 10
+  # 5 - Push camera back 1.5× instead of 1.0× so top-down renders include full underbelly
+  cam_pos_z_offset: 15
   fov: 25
   renderer_spp: 1
+  uniform_3d_rotation: true
 
 cfg_mask_discriminator:
-  enable_iter: [80000, 300000]
+  # 5 - Now starts at 40k, runs until 400k
+  enable_iter: [40000, 400000]
 
 
 ## Base predictor
@@ -89,10 +92,14 @@ cfg_predictor_instance:
     fov: ${...cfg_render.fov}
     max_trans_xy_range_ratio: 0.2
     max_trans_z_range_ratio: 0.5
-    rot_rep: quadlookat  # by default, only quadlookat, octlookat are supported
-    rot_temp_scalar: 1
-    naive_probs_iter: 2000
-    best_pose_start_iter: 6000
+    # 5 - Broad‐coverage, less collapse on pose
+    rot_rep: octlookat
+    # 5 - Increased for softer (more uniform) sampling
+    rot_temp_scalar: 1.5
+    # 5 - Delayed uniform random sampling end iteration
+    naive_probs_iter: 4000
+    # 5 - Delayed start of picking the best predicted pose
+    best_pose_start_iter: 8000
     lookat_zeroy: true
 
   enable_deform: true

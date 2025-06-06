@@ -16,14 +16,18 @@ checkpoint_name: null
 test_result_dir: null
 
 use_logger: true
-log_image_freq: 500
+log_image_freq: 300
 log_loss_freq: 50
 log_train: true
 log_val: true
 fix_log_batch: false
-save_train_result_freq: 10000
+save_train_result_freq: 100
 
 disc_train: true
 remake_dataloader_iter: -1 #500000
 shuffle_dataset_paths: true
 remake_dataloader_num: -1 # 1000
+
+enable_articulation: true
+cfg_articulation:
+  articulation_iter_range: [20000, inf]  # articulation disabled initially

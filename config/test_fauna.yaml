@@ -6,7 +6,7 @@ hydra:
 
 defaults:
   - base_fauna
-  - dataset: sequence # for visualize purpose
+  - dataset: image 
   - model: fauna
 
 
@@ -15,7 +15,7 @@ dataset:
   out_image_size: 256
   batch_size: 1
   num_frames: 1
-  test_data_dir: data/fauna/Fauna_dataset/large_scale/bear_comb_dinov2_new/test #  change to your image folder with *_rgb.png
+  test_data_dir: data/fauna/Fauna_dataset/few_shot_animal3d/weimaraner_dog/train
   random_shuffle_samples_train: true
   load_dino_feature: true
   dino_feature_dim: 16
@@ -30,8 +30,9 @@ checkpoint_dir: results/fauna/pretrained_fauna/
 checkpoint_name: pretrained_fauna.pth
 
 ## visualize_result
-output_dir: results/fauna/pretrained_fauna/visualization
-render_modes: [input_view, other_views, rotation]
+output_dir: results/fauna/pretrained_fauna/post_process/weimaraner_dog/visualization
+test_result_dir: results/fauna/pretrained_fauna/post_process/weimaraner_dog/visualization
+render_modes: [input_view] #[input_view, other_views, rotation]
 finetune_texture: false
 finetune_iters: 10
 finetune_lr: 0.001
