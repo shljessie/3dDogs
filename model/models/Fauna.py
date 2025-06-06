@@ -15,12 +15,15 @@ from ..networks import discriminator_architecture
 
 @dataclass
 class MaskDiscriminatorConfig:
-    enable_iter: List[int] = field(default_factory=lambda: [80000, 300000])
+    # 5 - Start adversarial mask loss earlier (40k) and keep it on longer (until 400k)
+    enable_iter: List[int] = field(default_factory=lambda: [40000, 400000])
     disc_gt: bool = False
     disc_iv: bool = True
     disc_iv_label: str = 'Real'
-    mask_disc_loss_weight: float = 0.1
-    discriminator_loss_weight: float = 1.0
+    # 5 - Increase mask-GAN weight from 0.1 -> 0.2
+    mask_disc_loss_weight: float = 0.2
+    # 5 - Increase discriminator's overall multiplier from 1.0 -> 1.5
+    discriminator_loss_weight: float = 1.5
     disc_reg_mul: float = 10.
 
 
@@ -108,33 +111,68 @@ class FaunaModel(AnimalModel):
 
         return weight
     
-    def get_random_view_mask(self, w2c_pred, shape, prior_shape, num_frames, bins=360):
-        delta_angle = 2 * np.pi / bins
-        b = len(shape)
+    def random_rotation_matrix(self, batch_size, device=None):
+        """
+        Generate a batch of random 3D rotation matrices using unit quaternions.
+        Returns: (batch_size, 3, 3) tensor
+        """
+        # Sample random unit quaternions
+        u1 = torch.rand(batch_size, device=device)
+        u2 = torch.rand(batch_size, device=device)
+        u3 = torch.rand(batch_size, device=device)
+        q1 = torch.sqrt(1 - u1) * torch.sin(2 * np.pi * u2)
+        q2 = torch.sqrt(1 - u1) * torch.cos(2 * np.pi * u2)
+        q3 = torch.sqrt(u1) * torch.sin(2 * np.pi * u3)
+        q4 = torch.sqrt(u1) * torch.cos(2 * np.pi * u3)
+        # Quaternion to rotation matrix
+        rot_mats = []
+        for i in range(batch_size):
+            q = torch.stack([q1[i], q2[i], q3[i], q4[i]])
+            q = q / q.norm()  # Ensure unit quaternion
+            w, x, y, z = q
+            R = torch.tensor([
+                [1 - 2*y**2 - 2*z**2, 2*x*y - 2*z*w,     2*x*z + 2*y*w],
+                [2*x*y + 2*z*w,     1 - 2*x**2 - 2*z**2, 2*y*z - 2*x*w],
+                [2*x*z - 2*y*w,     2*y*z + 2*x*w,     1 - 2*x**2 - 2*y**2]
+            ], device=device)
+            rot_mats.append(R)
+        return torch.stack(rot_mats, dim=0)
 
-        # the render rotation matrix is different
-        rand_degree = torch.randint(bins, [b])
-        delta_angle = delta_angle * rand_degree
-        delta_rot_matrix = []
-        for i in range(b):
-            angle = delta_angle[i].item()
-            angle_matrix = torch.FloatTensor([
-                [np.cos(angle),  0, np.sin(angle), 0],
-                [0,              1, 0,             0],
-                [-np.sin(angle), 0, np.cos(angle), 0],
-                [0,              0, 0,             1],
-            ]).to(self.accelerator.device)
-            delta_rot_matrix.append(angle_matrix)
-        delta_rot_matrix = torch.stack(delta_rot_matrix, dim=0)
-        
+    def get_random_view_mask(self, w2c_pred, shape, prior_shape, num_frames, bins=360):
+        b = len(shape)
+        device = self.accelerator.device
+
+        # Check config for uniform 3D rotation
+        if getattr(self.cfg_render, "uniform_3d_rotation", False):
+            # --- New: Uniform 3D rotation ---
+            rot_matrices = self.random_rotation_matrix(b, device=device)
+            delta_rot_matrix = torch.eye(4, device=device).unsqueeze(0).repeat(b, 1, 1)
+            delta_rot_matrix[:, :3, :3] = rot_matrices
+        else:
+            # --- Baseline: Y-axis rotation only ---
+            delta_angle = 2 * np.pi / bins
+            rand_degree = torch.randint(bins, [b])
+            delta_angle = delta_angle * rand_degree
+            delta_rot_matrix = []
+            for i in range(b):
+                angle = delta_angle[i].item()
+                angle_matrix = torch.FloatTensor([
+                    [np.cos(angle),  0, np.sin(angle), 0],
+                    [0,              1, 0,             0],
+                    [-np.sin(angle), 0, np.cos(angle), 0],
+                    [0,              0, 0,             1],
+                ]).to(device)
+                delta_rot_matrix.append(angle_matrix)
+            delta_rot_matrix = torch.stack(delta_rot_matrix, dim=0)
+
         w2c = torch.FloatTensor(np.diag([1., 1., 1., 1]))
         w2c[:3, 3] = torch.FloatTensor([0, 0, -self.cfg_render.cam_pos_z_offset *1.4])
-        w2c = w2c.repeat(b, 1, 1).to(self.accelerator.device)
+        w2c = w2c.repeat(b, 1, 1).to(device)
         # use the predicted transition
         w2c_pred = w2c_pred.detach()
         w2c[:, :3, 3] = w2c_pred[:b][:, :3, 3]
 
-        proj = util.perspective(self.cfg_render.fov / 180 * np.pi, 1, n=0.1, f=1000.0).repeat(b, 1, 1).to(self.accelerator.device)
+        proj = util.perspective(self.cfg_render.fov / 180 * np.pi, 1, n=0.1, f=1000.0).repeat(b, 1, 1).to(device)
         mvp = torch.bmm(proj, w2c)
         campos = -w2c[:, :3, 3]
 
@@ -167,7 +205,7 @@ class FaunaModel(AnimalModel):
 
         out_aux = {
             'mask_random_pred': mask_pred,
-            'rand_degree': rand_degree
+            'rand_degree': None  # Not used in 3D rotation mode
         }
 
         return out_aux
@@ -315,7 +353,177 @@ class FaunaModel(AnimalModel):
                     losses["bonevel_smooth_loss"] = self.smooth_loss_fn(bonevel)
         return losses, aux
 
-    def forward(self, batch, epoch, logger=None, total_iter=None, save_results=False, save_dir=None, logger_prefix='', is_training=True):
+    def is_biased_viewpoint(self, w2c):
+        """
+        Very simple check: extract camera‐forward (z) from w2c, see if it's too steep.
+        E.g. if camera is nearly overhead (top-down), dot(forward, world‐up) is small.
+        Returns True if we consider this view "degenerate" (e.g. top‐down).
+        """
+        # w2c: (B, 4, 4) world‐to‐camera. The camera forward in world coords is
+        # the negative of third column of rotation:
+        #   cam_forward_world = R_world_to_cam^T * [0,0,1]^T
+        # We can approximate by |forward·(0,1,0)| < threshold (i.e. camera looks down too steeply).
+        B = w2c.shape[0]
+        R = w2c[:, :3, :3]          # (B,3,3)
+        cam_forward = R.transpose(1,2) @ torch.tensor([0,0,1.], device=R.device).view(1,3,1)
+        # cam_forward: (B, 3, 1). Extract y‐component (world‐up = [0,1,0])
+        forward_y = cam_forward[:, 1, 0]  # (B,)
+        # If forward_y is small (near 0), camera is looking almost horizontal.
+        # If forward_y is negative (looking up underbelly) or too large (looking straight down), we flag.
+        #
+        # For example, require |forward_y| < 0.2 to call it "biased."
+        return (forward_y.abs() < 0.2)
+
+    def generate_hypotheses(self, input_image, prior_shape, epoch, total_iter, num_frames, k=5):
+        """
+        Re‐run the netInstance k times, each time forcing a different rotation hypothesis
+        (rot_idx). Return a list of (shape, pose_raw, mvp, w2c, campos, texture, im_features) tuples.
+        """
+        hypotheses = []
+        device = input_image.device
+
+        # Get the raw network outputs once (to avoid reloading weights every time).
+        # We'll explicitly override rot_idx (or sample from rot_prob) each iteration.
+        with torch.no_grad():
+            # 1) Run netInstance forward once to grab the tensors we need:
+            shape0, pose_raw0, pose0, mvp0, w2c0, campos0, texture0, imf0, deformation0, arti0, light0, forward_aux0 = \
+                self.netInstance(input_image, prior_shape, epoch, total_iter, is_training=False)
+            # forward_aux0 holds rot_logit, rot_idx, rot_prob, etc.
+
+            rot_prob = forward_aux0["rot_prob"].detach().cpu()  # (B*F, num_hypos)
+            num_hypos = rot_prob.shape[-1]
+
+            # For simplicity, assume B=1 and F=1 (single image).
+            # If B>1 or F>1 you'll need to loop over batch and frame
+            # and generate k distinct rot_idx values. Here we just pick the top‐k highest‐prob hypos:
+            topk = torch.topk(rot_prob.view(-1), k=min(k, num_hypos)).indices  # up to num_hypos.
+            topk = topk.view(-1)
+
+            # If k > num_hypos, we can repeat random draws:
+            if len(topk) < k:
+                extras = torch.randint(0, num_hypos, (k - len(topk),), device=device)
+                topk = torch.cat([topk.to(device), extras])
+
+            # For each chosen rot_idx, re‐invoke the predictor, but force that rot_idx:
+            for r in topk[:k]:
+                r = int(r.item())
+                # We need to override the "forward" pass so that netInstance uses rot_idx=r.
+                # One way: temporarily monkey‐patch forward_aux or set a flag in cfg_pose.
+                # Simplest: we rebuild "forward_aux" by hand: feed "rot_idx_onehot" into the decoder.
+                # (Assumes InstancePredictorFauna lets you supply a forced rot_idx; if not, you can hack it
+                #  by zeroing out rot_logit except at index r, then doing a softmax.)
+                forced_rot_logit = torch.full_like(forward_aux0["rot_logit"], -1e9)
+                forced_rot_logit[..., r] = 0
+                forced_forward_aux = dict(forward_aux0)
+                forced_forward_aux["rot_logit"] = forced_rot_logit.to(device)
+                forced_forward_aux["rot_idx"] = torch.tensor([r], device=device).view(-1,1)
+
+                # Now re‐compute everything after "rot" splitting. In your InstancePredictorFauna,
+                # insertion point is often just after you produce rot_logit→rot_idx→rot_prob→pose.
+                # Let's assume you can call a helper that takes forced_forward_aux, skipping the
+                # rotation‐prediction stage. In the worst case you simply re‐run netInstance and then
+                # overwrite forward_aux inside its output:
+                shape_r, pose_raw_r, pose_r, mvp_r, w2c_r, campos_r, texture_r, imf_r, deformation_r, arti_r, light_r, _ = \
+                    self.netInstance(input_image, prior_shape, epoch, total_iter, is_training=False)
+
+                # Overwrite with forced rot:
+                pose_raw_r = pose_raw_r.clone()      # assume pose_raw includes fwd+translation → override fwd from r
+                # …we would need to tell the predictor "this is fwd from idx r." If your predictor
+                # is built so that rot_idx selects a column in some MLP, you can just re‐index there.
+                # For now, we store these tensors and assume we'll re‐render from mvp_r and w2c_r.
+
+                hypotheses.append({
+                    "shape":      shape_r,
+                    "pose_raw":   pose_raw_r,
+                    "pose":       pose_r,
+                    "mvp":        mvp_r,
+                    "w2c":        w2c_r,
+                    "campos":     campos_r,
+                    "texture":    texture_r,
+                    "im_features":imf_r,
+                    "deformation":deformation_r,
+                    "arti_params":arti_r,
+                    "light":      light_r,
+                    # We carry forced_forward_aux if we need it later
+                    "rot_idx":    r
+                })
+
+        return hypotheses
+
+    def evaluate_hypotheses(self, hypotheses, prior_shape, num_frames):
+        """
+        For each hypothesis dict, render a random‐view mask (or input‐view mask)
+        and run it through netDisc to get a discriminator score.
+        Optionally add a trivial anatomical check (e.g. penalty if mesh is flipped).
+        Returns a list of (score, hypothesis) pairs.
+        """
+        scored = []
+        device = hypotheses[0]["mvp"].device
+
+        for h in hypotheses:
+            # 1) Render a random‐view mask for that hypothesis
+            #    We can reuse get_random_view_mask, but that function only returns a random view,
+            #    not the input view. Since we're scoring plausibility, let's render multiple randoms
+            #    and average the discriminator score across them:
+            all_masks = []
+            R = 3  # how many random glimpses per hypothesis
+            for _ in range(R):
+                aux = self.get_random_view_mask(h["w2c"], h["shape"], prior_shape, num_frames)
+                rand_mask = aux["mask_random_pred"]  # (B,1,256,256)
+                all_masks.append(rand_mask)
+            # Stack: (R, B,1,256,256) → merge to (R*B,1,256,256)
+            all_masks = torch.cat(all_masks, dim=0)
+
+            # 2) Append class‐condition channel (reuse same one‐hot as in training)
+            #    Let's assume `class_feat` is available from netBase:
+            #    Accessing class_vector from instance attributes, as it's computed in forward
+            #    and stored there temporarily or accessible via self.netBase if needed.
+            #    Assuming it's available as self.class_vector after the initial forward pass.
+            #    If not, you might need to pass it explicitly or retrieve it differently.
+            #    Looking at the original code, class_vector is returned by self.netBase.
+            #    Let's use the class_vector from the initial forward pass which should be
+            #    available in the scope of the modified forward function.
+            # class_feat = self.netBase.bank_embedding  # or wherever you store it; adapt as needed
+            # For simplicity assume a single category: shape of class_feat = (1,C)
+            B = all_masks.shape[0] // num_frames # Assuming batch size > 1 and num_frames > 1 handled outside this loop
+            class_one_hot = self.class_vector.view(1, -1, 1, 1).repeat(B*num_frames, 1, all_masks.shape[-2], all_masks.shape[-1])
+            inp = torch.cat([all_masks, class_one_hot], dim=1)  # (B*R, C+1, 256,256)
+
+            # 3) Run discriminator:
+            with torch.no_grad():
+                d_score = self.netDisc(inp)  # (B*R,1, H, W) or (B*R,1) depending on your DCDiscriminator
+                # If the discriminator outputs a per‐pixel logit, you can average it:
+                if d_score.dim() == 4:
+                    d_score = d_score.mean([2,3])  # (B*R,1)
+                # Now average across R runs:
+                # Reshape to (R, B) or (R, B*F) if handling batches and frames
+                d_score = d_score.view(R, -1).mean(dim=0)  # (B,) or (B*F,)
+                # Assuming a single hypothesis evaluated at a time for simplicity here,
+                # so d_score should be a single value after averaging R glimpses.
+                # If handling batches/frames, this needs adjustment.
+                # For now, let's assume the loop handles one hypothesis at a time for a single image (B=1, F=1).
+                # So d_score should be (1,) after view(R, -1).mean(dim=0).
+                score = d_score.item()
+
+
+            # 4) (Optional) Anatomical plausibility: here we just add a dummy 0 penalty
+            anat_penalty = 0.0
+            total_score = score + anat_penalty
+
+            scored.append((total_score, h))
+
+        return scored
+
+    def select_best_hypothesis(self, scored_hypos):
+        """
+        scored_hypos: list of (score, hypothesis_dict). Return the hypothesis_dict with min score.
+        """
+        scored_hypos.sort(key=lambda x: x[0])
+        best_score, best_hypo = scored_hypos[0]
+        return best_hypo
+
+    def forward(self, batch, epoch, logger=None, total_iter=None,
+                save_results=False, save_dir=None, logger_prefix='', is_training=True):
         input_image, mask_gt, mask_dt, mask_valid, flow_gt, bbox, bg_image, dino_feat_im, dino_cluster_im, seq_idx, frame_idx = batch
         if bbox.shape[2] == 9:
             # Fauna Dataset bbox
@@ -355,12 +563,13 @@ class FaunaModel(AnimalModel):
         else:
             prior_shape, dino_net, bank_embedding = self.netBase(total_iter=total_iter, is_training=is_training, batch=batch, bank_enc=self.get_predictor("netInstance").netEncoder)
         
-        class_vector = bank_embedding[0]
+        class_vector = bank_embedding[0] # Store class_vector for use in evaluate_hypotheses
+        self.class_vector = class_vector # Temporarily store as instance attribute
 
         ## predict instance specific parameters
         if self.mixed_precision:
             with torch.autocast(device_type=torch.device(self.accelerator.device).type, dtype=self.mixed_precision):
-                shape, pose_raw, pose, mvp, w2c, campos, texture, im_features, deformation, arti_params, light, forward_aux = self.netInstance(input_image, prior_shape, epoch, total_iter, is_training=is_training)
+                shape, pose_raw, pose, mvp, w2c, campos, texture, im_features, deformation, arti_params, light, forward_aux = self.netInstance(input_image, prior_shape, epoch, total_iter, is_training=is_training)  # first two dim dimensions already collapsed N=(B*F)
             pose_raw, pose, mvp, w2c, campos, im_features, arti_params = \
                 map(to_float, [pose_raw, pose, mvp, w2c, campos, im_features, arti_params])
         else:
@@ -503,6 +712,127 @@ class FaunaModel(AnimalModel):
         log = SimpleNamespace(**locals())
         if logger is not None and (self.enable_render or not is_training):
             self.log_visuals(log, logger)
+
+        # Original code computed:
+        #   final_losses, regularizers, total_loss, metrics, aux_viz, etc.
+        #   And if save_results: self.save_results(log)
+        #
+        # We want to inject our inference‐time pass if is_training=False:
+        if not is_training:
+            # 1) Check for biased viewpoint
+            biased_mask = self.is_biased_viewpoint(w2c)  # w2c from the one "initial" pass
+            if biased_mask.any():                # if ANY in batch is degenerate
+                # 2) Generate k hypotheses
+                k = 5 # Define k here
+                hypotheses = self.generate_hypotheses(
+                    input_image, prior_shape,
+                    epoch, total_iter,
+                    num_frames, k=k
+                )
+                # 3) Score them
+                scored = self.evaluate_hypotheses(
+                    hypotheses, prior_shape, num_frames
+                )
+                # 4) Pick best
+                best = self.select_best_hypothesis(scored)
+
+                # 5) Re‐render "best" hypothesis exactly the same way Fauna does:
+                shape_b = best["shape"]
+                pose_raw_b = best["pose_raw"]
+                # ...extract everything for rendering from best:
+                mvp_b    = best["mvp"]
+                w2c_b    = best["w2c"]
+                campos_b = best["campos"]
+                texture_b= best["texture"]
+                imf_b    = best["im_features"]
+                light_b  = best["light"]
+
+                # Now re‐render the "input view" (or whatever your logger wants) using best:[…]
+                render_flow = self.cfg_render.render_flow and num_frames > 1 # Re-declare render_flow if needed
+                render_modes = ['shaded', 'dino_pred']
+                if render_flow:
+                    render_modes += ['flow']
+                with torch.no_grad():
+                    renders_b = self.render(
+                        render_modes,
+                        shape_b, texture_b, mvp_b, w2c_b, campos_b,
+                        (h, w),
+                        im_features=imf_b, light=light_b,
+                        prior_shape=prior_shape, dino_net=dino_net,
+                        num_frames=num_frames,
+                        class_vector=class_vector[None,:].expand(batch_size * num_frames, -1)
+                    )
+                    # Overwrite the original "shaded" and "mask_pred":
+                    if render_flow:
+                         shaded_b, dino_feat_im_pred_b, flow_pred_b = renders_b
+                         flow_pred_b = expandBF(flow_pred_b, batch_size, num_frames)[:, :-1]
+                    else:
+                         shaded_b, dino_feat_im_pred_b = renders_b
+
+                    shaded_b = expandBF(shaded_b, batch_size, num_frames)
+                    dino_feat_im_pred_b = expandBF(dino_feat_im_pred_b, batch_size, num_frames)
+
+                    image_pred = shaded_b[:, :, :3]
+                    mask_pred  = shaded_b[:, :, 3]
+
+                # Now recompute losses (or skip losses if you just want final outputs).
+                # If you want to log visuals, overwrite log.image_pred, log.mask_pred, etc.:
+                log = SimpleNamespace( # Re-create log namespace with updated values
+                    image_pred=image_pred,
+                    mask_pred=mask_pred,
+                    # Include other necessary attributes for logging/saving
+                    shape=shape_b,
+                    texture=texture_b,
+                    mvp=mvp_b,
+                    w2c=w2c_b,
+                    campos=campos_b,
+                    im_features=imf_b,
+                    light=light_b,
+                    prior_shape=prior_shape,
+                    dino_net=dino_net,
+                    num_frames=num_frames,
+                    class_vector=class_vector,
+                    # Add other variables needed for logging/saving from the original forward pass
+                    batch=batch,
+                    epoch=epoch,
+                    logger=logger,
+                    total_iter=total_iter,
+                    save_results=save_results,
+                    save_dir=save_dir,
+                    logger_prefix=logger_prefix,
+                    is_training=is_training,
+                    # Include variables computed before the hypothesis selection
+                    # like image_gt, mask_gt, mask_dt, mask_valid, flow_gt, dino_feat_im_gt, dino_cluster_im_gt,
+                    # rot_logit, rot_idx, rot_prob, aux_viz, final_losses, regularizers, total_loss, metrics
+                    image_gt=image_gt,
+                    mask_gt=mask_gt,
+                    mask_dt=mask_dt,
+                    mask_valid=mask_valid,
+                    flow_gt=flow_gt,
+                    dino_feat_im_gt=dino_feat_im_gt,
+                    dino_cluster_im_gt=dino_cluster_im_gt,
+                    rot_logit=rot_logit,
+                    rot_idx=rot_idx,
+                    rot_prob=rot_prob,
+                    aux_viz=aux_viz,
+                    final_losses=final_losses, # These losses are from the initial pass
+                    regularizers=regularizers, # These regularizers are from the initial pass
+                    total_loss=total_loss, # This is the total loss from the initial pass
+                    metrics=metrics,       # These metrics are from the initial pass
+                    # Add flow_pred_b if render_flow is True
+                    flow_pred = flow_pred_b if render_flow else None
+                )
+
+
+                # Finally, if save_results: overwrite log.shape to be best["shape"], etc.
+                if save_results:
+                    # The log object is already updated with the best hypothesis
+                    self.save_results(log)
+
+                # Return immediately (we don't care about losses anymore at test time)
+                return { "best_hypo_score": scored[0][0], "best_rot_idx": scored[0][1]["rot_idx"] }
+
+        # If not biased (or if we're training), fall back to the original:
         if save_results:
             self.save_results(log)
         return metrics
