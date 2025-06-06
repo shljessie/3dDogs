@@ -1,178 +1,176 @@
-# 3D Animals Codebase
+# 3D-Dogs: Silhouette-Guided 3D Reconstruction of Dogs from Single Images
 
+This repository builds on the **3D-Fauna** codebase (Li *et al.*, CVPR 2024) to specifically tackle the challenges of reconstructing accurate 3D dog meshes from a single RGB image. Dogs exhibit vast pose and breed variation—and viewpoints like top-down or frontal shots are underrepresented in typical training sets—leading to distorted outputs (e.g., flattened underbellies). We introduce a **mask-based adversarial discriminator** and a lightweight multiple-hypothesis selection scheme to enforce silhouette consistency from unseen angles.
 
-https://github.com/user-attachments/assets/c0dbb792-2ce8-424c-98db-8c8e6a3e2f29
+Seonghee Lee(shlee@cs.stanford.edu) - CS 231A
 
+---
 
-This repository contains the unified codebase for several projects on articulated 3D animal reconstruction and motion generation, including:
+## Method Overview
 
-- [MagicPony: Learning Articulated 3D Animals in the Wild](https://3dmagicpony.github.io/) (CVPR 2023) [![arXiv](https://img.shields.io/badge/arXiv-2211.12497-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2211.12497) - a category-specific single-image 3D animal reconstruction model
-- [Learning the 3D Fauna of the Web](https://kyleleey.github.io/3DFauna/) (CVPR 2024) [![arXiv](https://img.shields.io/badge/arXiv-2401.02400-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2401.02400) - a pan-category single-image 3D quadruped reconstruction model
-- [Ponymation: Learning Articulated 3D Animal Motions from Unlabeled Online Videos](https://keqiangsun.github.io/projects/ponymation/) (ECCV 2024) [![arXiv](https://img.shields.io/badge/arXiv-2312.13604-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2312.13604) - an articulated 3D animal motion generative model
+### 1. Base 3D Reconstruction Pipeline (3D-Fauna)
 
+At its core, we retain the standard 3D-Fauna architecture:
 
-## Installation
-See [INSTALL.md](./INSTALL.md).
+1. **Prior Shape Predictor**
+   A shared “bank” of shape embeddings (`netBase`) encodes coarse SDF-based animal priors.
+2. **Instance Predictor**
+   Given a single input image `I`, the instance network (`netInstance`) predicts:
 
-## Data
-### Tetrahedral Grids
-We adopt the hybrid SDF-mesh representation from [DMTet](https://research.nvidia.com/labs/toronto-ai/DMTet/) to represent the 3D shape of the animals. It uses tetrahedral grids to extract meshes from underlying SDF representation.
+   * A refined 3D shape as a tetrahedral SDF mesh.
+   * An articulation parameter set (pose).
+   * A texture field for albedo.
+   * Camera parameters (rotation hypotheses, translation, focal length, etc.).
+3. **Differentiable Renderer**
+   The predicted shape + texture + camera yields rendered outputs:
 
-Download the pre-computed tetrahedral grids:
-```shell
-cd data/tets
-sh download_tets.sh
-```
+   * **RGB image** (reconstructed appearance).
+   * **Silhouette mask** (foreground binary).
+   * **DINO feature maps** (optional perceptual features).
+     These are compared against the ground-truth image, mask, and DINO features to compute pixel-wise and perceptual losses.
 
-### Datasets
-Download the preprocessed datasets for each project using the download scripts provided in `data/`. All datasets should be downloaded in the same directory as the download script, for example:
-```shell
-cd data/magicpony
-sh download_horse_combined.sh
-```
-See the notes [below](#data-1) for the details of each dataset.
+Despite strong performance on generic quadrupeds, directly applying this pipeline to dog images often fails when dogs are photographed from uncommon angles (e.g., overhead). The network simply “hallucinates” a plausible—but inaccurate—underbelly, since it has never seen real silhouettes from that viewpoint during training.
 
+---
 
-## Pretrained Models
-The pretrained models can be downloaded using the scripts provided in `results/`. All pretrained models should be downloaded in the same directory as the download script, for example:
-```shell
-cd results/magicpony
-sh download_pretrained_horse.sh
-```
+### 2. Mask Discriminator: Enforcing Silhouette Realism from Unseen Views
 
+#### 2.1 Motivation
 
-## Run
-Once the data is prepared, both training and inference of all models can be executed using a single command:
-```shell
-python run.py --config-name CONFIG_NAME
-```
-or for training with DDP using multiple GPUs:
-```shell
-accelerate launch --multi_gpu run.py --config-name CONFIG_NAME
-```
-`CONFIG_NAME` can be any of the configs specified in `config/`, e.g., `test_magicpony_horse` or `train_magicpony_horse`.
+A 3D generator trained solely on input-view losses can cheat by producing a shape that matches the mask from the observed camera but collapses or warps under novel rotations. Enforcing pixel-level consistency on a random rotated silhouette—with only a reconstruction loss—still does not teach the network what a “correct” top-down dog mask should look like. Instead, we introduce a small CNN discriminator (`netDisc`) that learns real silhouette statistics (across all breeds/poses) and pushes the generator to produce silhouettes that “fool” it.
 
-### Testing using the Pretrained Models
-The simplest use case is to test the pretrained models on test images. To do this, use the configs in `configs/` that start with `test_*`. Open the config files to check the details, including the path of the test images.
+#### 2.2 Pipeline
 
-Note that only the RGB images are required during testing. The DINO features are not required. The mask images are only required if you wish to finetune the texture with higher precision for visualization (see [below](#test-time-texture-finetuning)).
+1. **Input-View Silhouette**
 
-When running the command with the default test configs, it will automatically save some basic visualizations, including the reconstructed views and 3D meshes. For more advanced and customized visualizations, use `scripts/visualize_results.py` as explained [below](#visualization).
+   * From batch `I`, we already compute a binary **mask\_gt** (ground truth) and let the model produce its **mask\_pred\_iv** under the predicted camera.
 
-### Training
-See the instructions for each specific model [below](#training-1).
+2. **Random-View Silhouette**
 
-### Visualization
-We provide some scripts that we used to generate the visualizations on our project pages ([MagicPony](https://3dmagicpony.github.io/), [3D-Fauna](https://kyleleey.github.io/3DFauna/), [Ponymation](https://keqiangsun.github.io/projects/ponymation/)). To render such visualizations, simply run the following command with the proper test config, e.g.:
-```shell
-python visualization/visualize_results.py --config-name test_magicpony_horse
-```
+   * We sample a **random rotation matrix** `R_rand` (either yaw-only or full 3D).
+   * We update the predicted 3D shape via `netInstance`, but replace its camera’s rotation matrix with `R_rand`.
+   * We render this rotated shape (same texture, same articulation) to obtain **mask\_pred\_rv**.
 
-For 3D-Fauna, use `visualize_results_fauna.py` instead:
-```shell
-python visualization/visualize_results_fauna.py --config-name test_fauna
-```
+3. **Class Embedding Concatenation**
 
-Check the `#Visualization` section in the config files for specific visualization configurations.
+   * We embed the instance’s predicted bank code (the “class vector”) into a `1×H×W` feature map and concatenate it with each binary silhouette, forming a tensor of shape `(1 + C)×H×W` (where `C` is the size of the class embedding).
 
-#### Rendering Modes
-The visualization script supports the following `render_modes`, which can be specified in the config:
-- `input_view`: image rendered from the input viewpoint of the reconstructed textured mesh, shading map, gray shape visualization.
-- `other_views`: image rendered from 12 viewpoints rotating around the vertical axis of the reconstructed textured mesh, gray shape visualization.
-- `rotation`: video rendered from continuously rotating viewpoints around the vertical axis of the reconstructed textured mesh, gray shape visualization.
-- `animation` (only supported for quadrupeds): two videos rendered from both a side viewpoint and continuously rotating viewpoints of the reconstructed textured mesh animated by interpolating a sequence of pre-configured articulation parameters. `arti_param_dir` can be set to `./visualization/animation_params` which contains a sequence of pre-computed keyframe articulation parameters.
-- `canonicalization` (only supported for quadrupeds): video of the reconstructed textured mesh morphing from the input pose to a pre-configured canonical pose.
+4. **Discriminator Forward Pass**
 
-#### Test-time Texture Finetuning
-To enable texture finetuning at test time, set `finetune_texture: true` in the config, and (optionally) adjust the number of finetune iterations `finetune_iters` and learning rate `finetune_lr`.
+   * `D_real`: feed `mask_gt ‖ class_embed` (concatenate along channels) → expect **Real** label.
+   * `D_fake_iv`: feed `mask_pred_iv ‖ class_embed` → expect **Fake** (for discriminator’s loss).
+   * `D_fake_rv`: feed `mask_pred_rv ‖ class_embed` → expect **Fake**.
 
-For more precise texture optimization, provide instance masks in the same folder as `*_mask.png`. Otherwise, the background pixels might be pasted onto the object if shape predictions are not perfectly aligned.
+5. **Adversarial Losses**
 
+   * **Discriminator Loss** (BCE):
 
-## MagicPony [![arXiv](https://img.shields.io/badge/arXiv-2211.12497-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2211.12497)
-[MagicPony](https://3dmagicpony.github.io/) learns a category-specific model for single-image articulated 3D reconstruction of an animal species.
+     $$
+       \mathcal{L}_D = \tfrac{1}{3}\bigl[\,
+         -\log D(\,mask_{gt} \| class\,)
+         - \log\bigl(1 - D(\,mask_{pred\_iv} \| class\,)\bigr)
+         - \log\bigl(1 - D(\,mask_{pred\_rv} \| class\,)\bigr)
+       \bigr].
+     $$
 
-### Data
-We trained MagicPony models on image collections of horses, giraffes, zebras, cows, and birds. The data download scripts in `data/magicpony` provide access to the following preprocessed datasets:
-- `horse_videos` and `bird_videos` were released by [DOVE](https://dove3d.github.io/).
-- `horse_combined` consists of `horse_videos` and additional images selected from [Weizmann Horse Database](https://www.kaggle.com/datasets/ztaihong/weizmann-horse-database), [PASCAL](http://host.robots.ox.ac.uk/pascal/VOC/), and [Horse-10](http://www.mackenziemathislab.org/horse10).
-- `giraffe_coco`, `zebra_coco` and `cow_coco` are filtered subsets of the [COCO dataset](https://cocodataset.org/).
+     We also optionally add a small gradient penalty on real masks (if `disc_gt=True`).
+   * **Generator (3D Predictor) Loss** (BCE):
 
-### Training
-To train MagicPony on the provided horse dataset or bird dataset from scratch, simply use the training configs: `train_magicpony_horse` or `train_magicpony_bird`, e.g.:
-```shell
-python run.py --config-name train_magicpony_horse
-```
-For multi-GPU training, use the `accelerator launch` command, e.g.:
-```shell
-accelerator launch --multi_gpu run.py --config-name train_magicpony_horse
-```
+     $$
+       \mathcal{L}_{G\_adv} 
+       = \tfrac{1}{2}\Bigl[
+         -\log D(\,mask_{pred\_iv} \| class\,) 
+         \;-\;\log D(\,mask_{pred\_rv} \| class\,)\Bigr].
+     $$
 
-To train it on the provided giraffe, zebra, or cow datasets, which are much smaller, please finetune from a _pretrained_ horse model using the finetuning configs: `finetune_magicpony_giraffe`, `finetune_magicpony_zebra`, or `finetune_magicpony_cow`.
+     In other words, the generator tries to push both input-view and random-view silhouettes to be classified as Real.
 
+6. **Total Generator Loss**
 
-## 3D-Fauna [![arXiv](https://img.shields.io/badge/arXiv-2401.02400-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2401.02400)
-[3D-Fauna](https://kyleleey.github.io/3DFauna/) learns a pan-category model for single-image articulated 3D reconstruction of any quadruped species.
+   $$
+     \mathcal{L}_G 
+     = \underbrace{\mathcal{L}_\text{RGB} + \lambda_\text{mask}\,\mathcal{L}_\text{mask} + \dots}_{\text{original reconstruction losses}}
+     \;+\;\alpha\,\mathcal{L}_{G\_adv}.
+   $$
 
-### Data
-The `Fauna Dataset`, which can be downloaded via the script `data/fauna/download_fauna_dataset.sh`, consists of video frames and images sourced from the Internet, as well as images from [DOVE](https://dove3d.github.io/), [APT-36K](https://github.com/pandorgan/APT-36K), [Animal3D](https://xujiacong.github.io/Animal3D/), and [Animals-with-Attributes](https://cvml.ista.ac.at/AwA2/).
+   * We keep the original RGB-, mask-, and DINO-feature reconstruction terms.
+   * We add the adversarial term with weight `α = mask_disc_loss_weight` (e.g., 0.2).
 
-### Training
-To train 3D-Fauna on the Fauna Dataset, simply run:
-```shell
-python run.py --config-name train_fauna
-```
+During backprop:
 
+1. **Generator Step**: we backpropagate through `netInstance`, `netBase`, and the differentiable renderer, summing the reconstruction + adversarial generator loss.
+2. **Discriminator Step**: we freeze the generator, then backpropagate through `netDisc` to minimize `ℒ_D`. This two-step loop is standard GAN training.
 
-## Ponymation [![arXiv](https://img.shields.io/badge/arXiv-2312.13604-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2312.13604)
-[Ponymation](https://keqiangsun.github.io/projects/ponymation/) learns a generative model of articulated 3D motions of an animal species.
+---
 
-### Data
-Dataset can be downloaded via the script `data/ponymation/download_ponymation_dataset.sh`, including video data of horse, cow, giraffe, and zebra.
+### 3. Random-View Sampling
 
-### Training
-Ponymation is trained in two stages. In the first stage, we pretrain a 3D reconstruction model that takes in a sequence of frames and reconstructs a sequence of articulated 3D shapes of the animal. This stage can be initiated using the stage 1 config `train_ponymation_horse_stage1`:
-```shell
-python run.py --config-name train_ponymation_horse_stage1
-```
+* **Yaw-Only Sampling** (baseline): draw a random yaw angle in `[0, 2π)`.
+* **Full 3D Sampling** (optional): sample a uniform random unit quaternion (pitch/yaw/roll).
 
-After this video reconstruction model is pretrained, we then train a generative model of the articulated 3D motions in the second stage, using the stage 2 config `train_ponymation_horse_stage2`:
-```shell
-python run.py --config-name train_ponymation_horse_stage2
-```
+  * When `cfg_render.uniform_3d_rotation=True`, we generate a random 3×3 rotation matrix from quaternions. Otherwise, we stick to Y-axis rotations for silhouette diversity.
+* **Camera Z-Offset**: by increasing `cam_pos_z_offset` (e.g., from 10→15), we ensure that the entire animal fits within the viewport even when rotated to extreme elevations (e.g., top-down).
 
+---
 
-## Citation
-If you use this repository or find the papers useful for your research, please consider citing the following publications, as well as the original publications of the datasets used:
-```
-@InProceedings{wu2023magicpony,
-  title     = {{MagicPony}: Learning Articulated 3D Animals in the Wild},
-  author    = {Wu, Shangzhe and Li, Ruining and Jakab, Tomas and Rupprecht, Christian and Vedaldi, Andrea},
-  booktitle = {CVPR},
-  year      = {2023}
-}
-```
+### 4. Post-Processing: ViewpointBiasDetector
+
+Even with silhouette adversarial training, extremely degenerate input viewpoints (e.g., pure overhead with severe occlusion) can still produce ambiguous results. We implement a lightweight **ViewpointBiasDetector** during inference:
+
+1. **Estimate Camera Direction**
+   After `netInstance` predicts its camera → we compute the forward‐looking direction in world space.
+2. **Compute Similarity to “Top-Down” Normal**
+   We compare the camera’s “downward” axis to the world’s up vector: if the absolute cosine similarity is below a threshold (e.g., 0.25), we suspect a degenerate viewpoint.
+3. **Multiple-Hypothesis Ranking**
+
+   * We generate *multiple* random rotations (e.g., 5–10 candidate yaw/pitch combinations).
+   * For each candidate, render the silhouette and compute the discriminator’s “realness” score.
+   * We also compute a lightweight anatomical plausibility measure: e.g., the variance of silhouette height, or silhouette aspect ratio.
+   * We reproject the input photo’s visible mask into 3D (via back-projection) and measure 2D consistency with each hypothesis’s mask.
+   * We choose the hypothesis that maximizes a weighted sum of (Discriminator score + silhouette‐input consistency).
+4. **Final Mesh**
+   We output the mesh corresponding to the selected hypothesis. By explicitly reranking over multiple views, we further reduce catastrophic shape collapse under rare angles—without retraining the entire network.
+
+---
+
+## Folder Structure & Data
 
 ```
-@InProceedings{li2024fauna,
-  title     = {Learning the 3D Fauna of the Web},
-  author    = {Li, Zizhang and Litvak, Dor and Li, Ruining and Zhang, Yunzhi and Jakab, Tomas and Rupprecht, Christian and Wu, Shangzhe and Vedaldi, Andrea and Wu, Jiajun},
-  booktitle = {CVPR},
-  year      = {2024}
-}
+3DAnimals/
+├── config/                       # Hydra configurations (train/test/infer)
+├── model/
+│   ├── datasets/
+│   ├── models/
+│   │   ├── AnimalModel.py        # Base classes, rendering, losses, etc.
+│   │   ├── Fauna.py              # 3D-Fauna extensions: mask discriminator, etc.
+│   │   └── … 
+│   ├── render/                   # Differentiable renderer utilities
+│   └── predictors/               # Base / instance predictor definitions
+├── results/
+│   └── fauna/pretrained_fauna/   # Inference outputs for various dog breeds
+│       └── <breed_name>/         # e.g., “weimaraner_dog”
+│           ├── visualization/    # Rendered images (input, mask_gt, mask_pred, mesh.obj, poses, etc.)
+│           ├── pretrained_fauna.pth  (removed from Git—see instructions below)
+│           └── … 
+├── run.py                        # Main training / testing entry point (Hydra)
+└── README.md                     # This file
 ```
 
-```
-@InProceedings{sun2024ponymation,
-  title     = {{Ponymation}: Learning Articulated 3D Animal Motions from Unlabeled Online Videos},
-  author    = {Sun, Keqiang and Litvak, Dor and Zhang, Yunzhi and Li, Hongsheng and Wu, Jiajun and Wu, Shangzhe},
-  booktitle = {ECCV},
-  year      = {2024}
-}
-```
+### Download Pretrained Models & Results
 
-## TODO
+* **Pretrained checkpoint** (160 MB) and **visualization outputs** are hosted via Google Drive:
+  👉 [Drive Folder](https://drive.google.com/drive/folders/11BmuqdPvFwrn9AUAFV2g1CxjemZKP0p_)
+  Download and unzip into:
 
-- [ ] Ponymation dataset update
-- [ ] Data processing script
-- [ ] Metrics evaluation script
+  ```
+  3DAnimals/results/fauna/pretrained_fauna/
+  ```
+
+  so that you have:
+
+  ```
+  results/fauna/pretrained_fauna/pretrained_fauna.pth
+  results/fauna/pretrained_fauna/<breed_name>/visualization/…
+  ```
+
+
